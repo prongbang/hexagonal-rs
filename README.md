@@ -109,3 +109,12 @@ async fn main() -> anyhow::Result<()> {
 - Use `FromRef` (or small newtype wrappers + `FromRef`) so each handler requests only the dependency it needs.
 - Put environment/config parsing in `bootstrap.rs`; keep `api/application/domain` framework‑agnostic.
 - For multiple binaries (API, worker, migrator), create `src/bin/<name>.rs` and share `bootstrap` helpers.
+
+## 🙏 Acknowledgments
+
+- Built with Rust 🦀
+- IDE Support by [RustRover](https://www.jetbrains.com/rust/)
+
+![RustRover](https://resources.jetbrains.com/help/img/idea/2024.3/RustRover_icon.svg)
+
+---
