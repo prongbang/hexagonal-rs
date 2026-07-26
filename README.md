@@ -1,5 +1,7 @@
 # Hexagonal/Clean Architecture Overview
 
+[![CI](https://github.com/prongbang/hexagonal-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/prongbang/hexagonal-rs/actions/workflows/ci.yml)
+
 This project follows a **Hexagonal/Clean Architecture** with a clear composition root and one–way dependencies.
 
 ```
@@ -12,6 +14,99 @@ src/
  └─ infrastructure/    # adapters (DB, cache, clients, etc.)
 ```
 
+## Quick Start
+
+### Prerequisites
+
+- Rust (stable, edition 2021).
+- `protoc` — required for local builds because `build.rs` compiles `proto/greeter.proto` via `tonic-prost-build`.
+  - macOS: `brew install protobuf`
+  - Debian/Ubuntu: `apt-get install protobuf-compiler`
+
+### Run
+
+```bash
+cargo run
+```
+
+Starts the HTTP server on `0.0.0.0:$PORT` (default `8080`).
+
+### Test
+
+```bash
+cargo test
+```
+
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on every push/PR to `main` (after installing `protoc`).
+
+### Examples
+
+```bash
+# local Greeter gRPC server for testing GET /hello/{name} (honors GREETER_PORT, default 50051)
+cargo run --example greeter_server
+
+# allocation-per-request measurement through the full router (routing + extractors + handlers + serde + repo)
+cargo run --release --example alloc_bench
+```
+
+### Docker
+
+```bash
+docker build -t hexagonal-rs .
+docker run -p 8080:8080 hexagonal-rs
+```
+
+The build stage installs `protobuf-compiler` itself, so no local `protoc` is needed just to build the image.
+
+## HTTP Endpoints
+
+| Method | Path | Description | Success | Failure |
+|---|---|---|---|---|
+| GET | `/health` | Liveness check | `200` `ok` | — |
+| POST | `/users` | Create a user. Body: `{"id": "...", "name": "..."}` | `201` `{"ok": true}` | `400` on empty/too-long `id` or `name` |
+| GET | `/users/{id}` | Fetch a user | `200` `User` JSON (`{"id", "name"}`) | `404` if not found |
+| GET | `/hello/{name}` | Greet via the outbound gRPC Greeter service | `200` `{"message": "..."}` | `503` if the circuit breaker is open or the upstream is unavailable |
+
+```bash
+curl -X POST localhost:8080/users -H 'content-type: application/json' -d '{"id":"u1","name":"Alice"}'
+curl localhost:8080/users/u1
+curl localhost:8080/hello/world
+```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `8080` | HTTP listen port |
+| `GREETER_ADDR` | `http://localhost:50051` | gRPC address of the upstream Greeter service |
+| `RUST_LOG` | `info` | Tracing log filter (`EnvFilter`) |
+| `DATABASE_URL` | unset (in-memory repo) | Optional. SQLite file path (e.g. `app.db` or `/data/app.db`) for the Diesel-backed `UserRepository`. Unset falls back to the in-memory adapter. |
+
+## Outbound gRPC + Circuit Breaker
+
+- The `Greeter` port (`src/domain/ports.rs`) is implemented by `GrpcGreeter` (`src/infrastructure/grpc_greeter.rs`), which wraps a generated `GreeterClient` (from `proto/greeter.proto`, compiled by `build.rs`).
+- The underlying tonic `Channel` is wrapped with a tower `BreakerLayer` (`src/infrastructure/circuit_breaker.rs`), backed by [`recloser`](https://docs.rs/recloser). The default breaker (`default_breaker()`) opens once ≥50% of the last 100 calls fail, and after a 30s cooldown allows a half-open trial call through.
+- The tonic `Endpoint` is configured with a 2s connect timeout and a 5s request timeout (`GrpcGreeter::connect_lazy`).
+- When the circuit is open, calls are rejected before hitting the network and mapped to `DomainError::Unavailable`; the same mapping applies to genuine gRPC `Unavailable`/`DeadlineExceeded` statuses. The `api` layer turns `DomainError::Unavailable` into HTTP `503`.
+- Swapping the greeter implementation or tuning the breaker/timeouts only touches `bootstrap.rs` (`build_services()`) — `domain` and `api` stay unaware of gRPC/recloser.
+
+## Benchmarks
+
+Reference numbers from one machine (Apple M4 Pro, release build, `wrk -t4 -c64`, localhost) — not a guarantee for other hardware or workloads. Reproduce throughput with `wrk` against `cargo run --release`, and allocation counts with `cargo run --release --example alloc_bench`.
+
+| Backend | GET /users/{id} | POST /users |
+|---|---|---|
+| In-memory | ~175k req/s, p99 ~0.5ms | ~175k req/s, p99 ~0.5ms |
+| Diesel/SQLite (WAL) | ~41k req/s | ~51k req/s |
+
+Allocations per request (`alloc_bench`):
+
+| Endpoint | In-memory | Diesel |
+|---|---|---|
+| `GET /health` | 15 | 15 |
+| `GET /users/{id}` | 25 | 32 |
+| `POST /users` | 35 | 46 |
+
 ## Responsibilities
 
 ### `main.rs` — Entrypoint
@@ -20,10 +115,10 @@ src/
 - Contains no business logic or wiring details.
 
 ### `bootstrap.rs` — Composition Root
-- Builds concrete adapters (e.g., Postgres vs. in-memory), services, and the HTTP router/state.
+- Builds concrete adapters (e.g., Diesel/SQLite vs. in-memory), services, and the HTTP router/state.
 - The only module allowed to import **everything** (api + application + domain + infra).
 - Great place to switch implementations by config/env/feature flags.
-- Provide helpers for tests (e.g., `build_test_router()` using in-memory adapters).
+- Tests build on top of it: call `bootstrap::build_services()` to get real defaults (in-memory repo, `GrpcGreeter`), then swap in a fake port implementation before passing the services to `api::router()`. See `tests/api.rs` (`FakeGreeter`) for the pattern. One test also asserts the response JSON's exact key set (`["id", "name"]`) as a trip-wire: if the domain `User` gains a field, that assertion fails instead of silently widening the public API — the fix is a response DTO, not loosening the test.
 
 ### `api/` — Delivery/HTTP Layer
 - Axum routes and handlers (HTTP ⇄ DTOs).
@@ -38,12 +133,17 @@ src/
 
 ### `domain/` — Core
 - Entities, value objects, domain services, and domain errors.
-- **Ports (traits)** such as `UserRepository` are defined here.
+- **Ports (traits)** such as `UserRepository` are defined here, each documenting a behavioral contract — e.g. `UserRepository::save` is an upsert and never returns `NotFound`; `get` returns `NotFound` when the id is absent, not an empty/default value. Adapters must honor the documented contract so they stay substitutable.
 - Pure business rules; framework‑agnostic; minimal dependencies.
 
 ### `infrastructure/` — Adapters
-- Implements domain ports: DB repositories (sqlx/SeaORM), caches (Redis), MQ, external HTTP clients, logging, config, migrations.
+- Implements domain ports: DB repositories, caches, MQ, external clients (gRPC), logging, config, migrations.
 - Swappable without touching `domain`/`application` code.
+- `UserRepository` ships two adapters: `in_memory_repo::InMemoryUserRepository` (default) and `diesel_repo::DieselUserRepository`, selected at startup by setting `DATABASE_URL` (see `bootstrap::build_router`).
+- Diesel/SQLite plumbing shared by every repository lives in `diesel_db.rs`, not in the repository itself: `build_pool(url)` runs the embedded migrations and, on a single setup connection, switches the database file to `WAL` mode once; the resulting r2d2 pool is wrapped in a cheap-to-clone `Db` handle whose `run(closure)` does the `spawn_blocking` + connection checkout + error mapping every repository needs. `DieselUserRepository::new(db: Db)` just takes that handle, so a future repository shares the same pool by cloning `Db` rather than re-deriving pool/pragma logic.
+- Every pooled connection also sets `PRAGMA busy_timeout` and `PRAGMA synchronous = NORMAL` on acquire: SQLite allows only one writer at a time, so without WAL + `busy_timeout` concurrent writers fail immediately with `SQLITE_BUSY` instead of waiting their turn.
+- The composition root (`bootstrap.rs`) is the only place that builds the pool and constructs `DieselUserRepository`; repositories never see `DATABASE_URL` or the pool directly.
+- Moving to Postgres later means swapping the `diesel` `sqlite` feature for `postgres` and pointing `DATABASE_URL` at a Postgres connection string — the port and call sites don't change.
 
 ## Dependency Direction
 
@@ -67,38 +167,46 @@ bootstrap depends on all to assemble the app
 - **Swappable adapters:** change DB/clients in `infrastructure/`, adjust wiring only in `bootstrap.rs`.
 - **Clear boundaries:** each layer has a single responsibility; accidental cross‑layer imports are easy to spot.
 - **Performance option:** keep services **concrete** (no `dyn`) and use **closure handlers** in `api` so the compiler **monomorphizes** them (no vtable on hot paths). Use `dyn` only when you need maximum runtime flexibility.
-- **State cloning:** prefer storing types that are cheap to clone (e.g., `sqlx::Pool`, `reqwest::Client` are already cheap/Arc-backed). Wrap custom non‑clone resources in `Arc<T>` only when necessary.
+- **State cloning:** prefer storing types that are cheap to clone (e.g., `diesel::r2d2::Pool` and `tonic::transport::Channel` are already cheap/Arc-backed — see `Db` in `diesel_db.rs`). Wrap custom non‑clone resources in `Arc<T>` only when necessary.
 
-## Getting Started (example sketch)
+## Getting Started (wiring, simplified)
+
+The real wiring lives in `src/bootstrap.rs` and `src/main.rs`; this is the shape of it,
+trimmed for illustration (see those files for the actual code, including the
+greeter/circuit-breaker wiring, `PORT`/`GREETER_ADDR` env handling, and graceful shutdown):
 
 ```rust
 // bootstrap.rs
 use std::sync::Arc;
-use crate::{api, application::UserServiceImpl, infrastructure::in_memory_repo::InMemoryUserRepository};
+use crate::{
+    api,
+    application::UserServiceImpl,
+    infrastructure::{
+        circuit_breaker::default_breaker, grpc_greeter::GrpcGreeter,
+        in_memory_repo::InMemoryUserRepository,
+    },
+};
 
 pub fn build_router() -> axum::Router {
     let repo = Arc::new(InMemoryUserRepository::new());
     let user_svc = Arc::new(UserServiceImpl::new(repo));
+    let greeter = Arc::new(
+        GrpcGreeter::connect_lazy("http://localhost:50051", default_breaker()).unwrap(),
+    );
 
-    let services = api::Services { user: user_svc };
-    api::router(services) // returns Router<()> — ready to serve
+    let services = api::Services { user: user_svc, greeter };
+    api::router(services) // returns Router — ready to serve
 }
 ```
 
 ```rust
 // main.rs
 use tokio::net::TcpListener;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new("info"))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = crate::bootstrap::build_router();
-    let listener = TcpListener::bind("0.0.0.0:3000").await?;
+    let listener = TcpListener::bind("0.0.0.0:8080").await?;
     axum::serve(listener, app).await?;
     Ok(())
 }

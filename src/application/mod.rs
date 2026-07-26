@@ -1,6 +1,6 @@
-use std::sync::Arc;
+use crate::domain::{DomainError, User, UserRepository};
 use async_trait::async_trait;
-use crate::domain::{User, UserRepository, DomainError};
+use std::sync::Arc;
 
 #[async_trait]
 pub trait UserService: Send + Sync {
@@ -13,7 +13,9 @@ pub struct UserServiceImpl<R: UserRepository> {
 }
 
 impl<R: UserRepository> UserServiceImpl<R> {
-    pub fn new(repo: Arc<R>) -> Self { Self { repo } }
+    pub fn new(repo: Arc<R>) -> Self {
+        Self { repo }
+    }
 }
 
 #[async_trait]
